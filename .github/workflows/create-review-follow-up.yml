@@ -351,6 +351,24 @@ jobs:
             return comment?.commit?.oid || pullRequest.headRefOid;
           }
 
+          function formatNumberedSnippet(path, entries) {
+            if (!entries.length)
+              return null;
+
+            const width = String(Math.max(...entries.map((entry) => entry.lineNumber))).length;
+            const language = languageForPath(path);
+            const body = truncateDiffHunk(
+              entries
+                .map((entry) => {
+                  const marker = entry.marked ? ">" : " ";
+                  return `${marker} ${String(entry.lineNumber).padStart(width)} | ${entry.text}`;
+                })
+                .join("\n")
+            );
+
+            return [`\`\`\`\`${language}`, body, "````"].join("\n");
+          }
+
           function formatCodeSnippet(content, path, range) {
             const lines = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
             const start = Math.min(range.contextStart, lines.length);
@@ -359,27 +377,148 @@ jobs:
             if (!start || start > end)
               return null;
 
-            const width = String(end).length;
-            const snippet = [];
+            const entries = [];
 
             for (let lineNumber = start; lineNumber <= end; ++lineNumber) {
-              const marker =
-                lineNumber >= range.markedStart && lineNumber <= range.markedEnd ? ">" : " ";
-              snippet.push(`${marker} ${String(lineNumber).padStart(width)} | ${lines[lineNumber - 1]}`);
+              entries.push({
+                lineNumber,
+                marked: lineNumber >= range.markedStart && lineNumber <= range.markedEnd,
+                text: lines[lineNumber - 1],
+              });
             }
 
-            const language = languageForPath(path);
-            const body = truncateDiffHunk(snippet.join("\n"));
-            return [`\`\`\`\`${language}`, body, "````"].join("\n");
+            return formatNumberedSnippet(path, entries);
+          }
+
+          function rangeForDiffHunk(thread, comment) {
+            if (thread.diffSide === "LEFT") {
+              const end =
+                positiveInteger(comment?.originalLine) ||
+                positiveInteger(thread.originalLine) ||
+                positiveInteger(comment?.line) ||
+                positiveInteger(thread.line);
+              const start =
+                positiveInteger(comment?.originalStartLine) ||
+                positiveInteger(thread.originalStartLine) ||
+                positiveInteger(comment?.startLine) ||
+                positiveInteger(thread.startLine);
+
+              return end ? normalizeRange(start, end, true) : null;
+            }
+
+            const end =
+              positiveInteger(comment?.line) ||
+              positiveInteger(thread.line) ||
+              positiveInteger(comment?.originalLine) ||
+              positiveInteger(thread.originalLine);
+            const start =
+              positiveInteger(comment?.startLine) ||
+              positiveInteger(thread.startLine) ||
+              positiveInteger(comment?.originalStartLine) ||
+              positiveInteger(thread.originalStartLine);
+
+            return end ? normalizeRange(start, end, false) : null;
+          }
+
+          function diffHunkStart(line) {
+            const match = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+
+            if (!match)
+              return null;
+
+            return {
+              left: Number(match[1]),
+              right: Number(match[2]),
+            };
+          }
+
+          function formatDiffHunkSnippet(diffHunk, path, thread, comment) {
+            const range = rangeForDiffHunk(thread, comment);
+            const side = thread.diffSide === "LEFT" ? "LEFT" : "RIGHT";
+            const entries = [];
+            let leftLine = null;
+            let rightLine = null;
+
+            for (const rawLine of diffHunk.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n")) {
+              const start = diffHunkStart(rawLine);
+
+              if (start) {
+                leftLine = start.left;
+                rightLine = start.right;
+                continue;
+              }
+
+              if (leftLine === null || rightLine === null || rawLine.startsWith("\\"))
+                continue;
+
+              const prefix = rawLine[0];
+              const text = rawLine.slice(1);
+
+              if (prefix === " ") {
+                entries.push({
+                  lineNumber: side === "LEFT" ? leftLine : rightLine,
+                  changed: false,
+                  marked:
+                    !!range &&
+                    (side === "LEFT" ? leftLine : rightLine) >= range.markedStart &&
+                    (side === "LEFT" ? leftLine : rightLine) <= range.markedEnd,
+                  text,
+                });
+                leftLine += 1;
+                rightLine += 1;
+                continue;
+              }
+
+              if (prefix === "-") {
+                if (side === "LEFT") {
+                  entries.push({
+                    lineNumber: leftLine,
+                    changed: true,
+                    marked:
+                      !!range && leftLine >= range.markedStart && leftLine <= range.markedEnd,
+                    text,
+                  });
+                }
+
+                leftLine += 1;
+                continue;
+              }
+
+              if (prefix === "+") {
+                if (side === "RIGHT") {
+                  entries.push({
+                    lineNumber: rightLine,
+                    changed: true,
+                    marked:
+                      !!range && rightLine >= range.markedStart && rightLine <= range.markedEnd,
+                    text,
+                  });
+                }
+
+                rightLine += 1;
+              }
+            }
+
+            if (entries.length && !entries.some((entry) => entry.marked)) {
+              const changedEntries = entries.filter((entry) => entry.changed);
+
+              if (changedEntries.length === 1)
+                changedEntries[0].marked = true;
+            }
+
+            return formatNumberedSnippet(path, entries);
           }
 
           async function formatCodeContext(thread, comment, pullRequest) {
-            const diffHunk = truncateDiffHunk(comment?.diffHunk?.trim());
+            const diffHunk = comment?.diffHunk?.trim();
 
             if (!diffHunk)
               return await formatFallbackCodeContext(thread, comment, pullRequest);
 
-            return ["````diff", diffHunk, "````"].join("\n");
+            return (
+              formatDiffHunkSnippet(diffHunk, comment?.path || thread.path, thread, comment) ||
+              "_Source context is not available for this review thread._"
+            );
           }
 
           async function formatFallbackCodeContext(thread, comment, pullRequest) {
@@ -388,28 +527,19 @@ jobs:
             const ref = fallbackRef(pullRequest, range, comment);
 
             if (!path || !range || !ref)
-              return "_No diff hunk or exact source range is available for this review thread._";
+              return "_Source context is not available for this review thread._";
 
             const content = await getFileContent(path, ref);
 
             if (!content)
-              return "_No diff hunk is available, and the source file could not be fetched._";
+              return "_Source context is not available for this review thread._";
 
             const snippet = formatCodeSnippet(content, path, range);
 
             if (!snippet)
-              return "_No diff hunk is available, and the source range could not be found in the fetched file._";
+              return "_Source context is not available for this review thread._";
 
-            const context =
-              range.singleLine
-                ? "showing the marked line with 3 preceding lines of context"
-                : `showing marked lines ${range.markedStart}-${range.markedEnd}`;
-
-            return [
-              `_Diff hunk unavailable; ${context} from ${range.original ? "the original comment commit" : "the comment commit"}._`,
-              "",
-              snippet,
-            ].join("\n");
+            return snippet;
           }
 
           async function formatThread(thread, index, pullRequest) {
@@ -420,11 +550,9 @@ jobs:
             const lines = [
               `### ${index}. ${formatLocation(thread, firstComment)}`,
               "",
-              `${authorName(firstComment)} left [a review comment](${url}). Status: ${status}.`,
-              "",
               await formatCodeContext(thread, firstComment, pullRequest),
               "",
-              "**Reviewer comment**",
+              `${authorName(firstComment)} left [a review comment](${url}). Status: ${status}.`,
               "",
               quote(firstComment?.body),
             ];
