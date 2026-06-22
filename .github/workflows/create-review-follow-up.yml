@@ -51,6 +51,7 @@ jobs:
           const issueMarker = `<!-- ${marker} -->`;
           const commentMarker = `<!-- ${marker}-comment -->`;
           const maxCommentChars = 3500;
+          const maxDiffHunkChars = 5000;
           const maxIssueBodyChars = 60000;
 
           if (!token)
@@ -133,6 +134,7 @@ jobs:
                             }
                             body
                             createdAt
+                            diffHunk
                             id
                             isMinimized
                             minimizedReason
@@ -189,8 +191,18 @@ jobs:
               .join("\n");
           }
 
-          function unique(values) {
-            return [...new Set(values.filter(Boolean))];
+          function truncateDiffHunk(text) {
+            if (!text)
+              return "";
+
+            if (text.length <= maxDiffHunkChars)
+              return text;
+
+            return `${text.slice(0, maxDiffHunkChars - 52).trimEnd()}\n# ...[truncated, open the linked thread for the full diff]`;
+          }
+
+          function authorName(comment) {
+            return comment?.author?.login ? `@${comment.author.login}` : "unknown";
           }
 
           function lineRange(thread) {
@@ -219,19 +231,28 @@ jobs:
             return visible.length ? visible : submitted;
           }
 
+          function formatDiffHunk(comment) {
+            const diffHunk = truncateDiffHunk(comment?.diffHunk?.trim());
+
+            if (!diffHunk)
+              return "_No diff hunk is available for this review thread._";
+
+            return ["````diff", diffHunk, "````"].join("\n");
+          }
+
           function formatThread(thread, index) {
             const comments = submittedVisibleComments(thread);
             const firstComment = comments[0] || thread.comments.nodes[0];
-            const authors = unique(
-              comments.map((comment) => comment.author?.login).map((login) => login && `@${login}`)
-            );
             const status = thread.isOutdated ? "unresolved, outdated by newer changes" : "unresolved";
             const url = firstComment?.url || `${serverUrl}/${repository}/pull/${prNumber}`;
             const lines = [
               `### ${index}. ${formatLocation(thread)}`,
-              `- Thread: [open in PR](${url})`,
-              `- Authors: ${authors.length ? authors.join(", ") : "unknown"}`,
-              `- Status: ${status}`,
+              "",
+              `${authorName(firstComment)} left [a review comment](${url}). Status: ${status}.`,
+              "",
+              formatDiffHunk(firstComment),
+              "",
+              "**Reviewer comment**",
               "",
               quote(firstComment?.body),
             ];
@@ -247,8 +268,7 @@ jobs:
               lines.push("", "<details>", "<summary>Full thread</summary>", "");
 
               for (const comment of comments) {
-                const author = comment.author?.login ? `@${comment.author.login}` : "unknown";
-                lines.push(`#### ${author} on ${comment.createdAt}`);
+                lines.push(`#### ${authorName(comment)} on ${comment.createdAt}`);
                 lines.push("");
                 lines.push(`[Open comment](${comment.url})`);
                 lines.push("");
