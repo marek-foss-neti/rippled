@@ -53,6 +53,7 @@ jobs:
           const maxCommentChars = 3500;
           const maxDiffHunkChars = 5000;
           const maxIssueBodyChars = 60000;
+          const fileContentCache = new Map();
 
           if (!token)
             throw new Error("GH_TOKEN is required");
@@ -110,6 +111,7 @@ jobs:
               ) {
                 repository(owner: $owner, name: $repo) {
                   pullRequest(number: $number) {
+                    headRefOid
                     number
                     title
                     url
@@ -134,11 +136,23 @@ jobs:
                             }
                             body
                             createdAt
+                            commit {
+                              oid
+                            }
                             diffHunk
                             id
                             isMinimized
+                            line
                             minimizedReason
+                            originalCommit {
+                              oid
+                            }
+                            originalLine
+                            originalStartLine
+                            path
                             state
+                            startLine
+                            subjectType
                             updatedAt
                             url
                           }
@@ -205,9 +219,9 @@ jobs:
             return comment?.author?.login ? `@${comment.author.login}` : "unknown";
           }
 
-          function lineRange(thread) {
-            const start = thread.startLine || thread.originalStartLine;
-            const end = thread.line || thread.originalLine;
+          function lineRange(subject) {
+            const start = subject.startLine || subject.originalStartLine;
+            const end = subject.line || subject.originalLine;
 
             if (!end)
               return "";
@@ -218,11 +232,15 @@ jobs:
             return `:${end}`;
           }
 
-          function formatLocation(thread) {
-            if (thread.subjectType === "FILE")
-              return `\`${thread.path}\``;
+          function formatLocation(thread, comment) {
+            const path = comment?.path || thread.path;
+            const subjectType = comment?.subjectType || thread.subjectType;
+            const subject = comment?.path ? comment : thread;
 
-            return `\`${thread.path}${lineRange(thread)}\``;
+            if (subjectType === "FILE")
+              return `\`${path}\``;
+
+            return `\`${path}${lineRange(subject)}\``;
           }
 
           function submittedVisibleComments(thread) {
@@ -231,26 +249,180 @@ jobs:
             return visible.length ? visible : submitted;
           }
 
-          function formatDiffHunk(comment) {
+          function encodeContentPath(path) {
+            return path.split("/").map(encodeURIComponent).join("/");
+          }
+
+          async function getFileContent(path, ref) {
+            if (!path || !ref)
+              return null;
+
+            const cacheKey = `${ref}:${path}`;
+
+            if (fileContentCache.has(cacheKey))
+              return fileContentCache.get(cacheKey);
+
+            try {
+              const file = await request(
+                "GET",
+                `/repos/${owner}/${repo}/contents/${encodeContentPath(path)}?ref=${encodeURIComponent(ref)}`
+              );
+
+              if (Array.isArray(file) || file.type !== "file" || !file.content) {
+                fileContentCache.set(cacheKey, null);
+                return null;
+              }
+
+              const content = Buffer.from(file.content.replace(/\s/g, ""), "base64").toString("utf8");
+              fileContentCache.set(cacheKey, content);
+              return content;
+            } catch (error) {
+              console.warn(`Could not fetch ${path} at ${ref}: ${error.message}`);
+              fileContentCache.set(cacheKey, null);
+              return null;
+            }
+          }
+
+          function languageForPath(path) {
+            const extension = path?.split(".").pop()?.toLowerCase();
+            const languages = {
+              c: "c",
+              cc: "cpp",
+              cpp: "cpp",
+              cxx: "cpp",
+              h: "cpp",
+              hpp: "cpp",
+              hxx: "cpp",
+              js: "javascript",
+              json: "json",
+              md: "markdown",
+              py: "python",
+              sh: "bash",
+              yml: "yaml",
+              yaml: "yaml",
+            };
+
+            return languages[extension] || "";
+          }
+
+          function positiveInteger(value) {
+            return Number.isInteger(value) && value > 0 ? value : null;
+          }
+
+          function fallbackRange(thread, comment) {
+            const currentEnd = positiveInteger(comment?.line) || positiveInteger(thread.line);
+            const currentStart = positiveInteger(comment?.startLine) || positiveInteger(thread.startLine);
+
+            if (currentEnd)
+              return normalizeRange(currentStart, currentEnd, false);
+
+            const originalEnd =
+              positiveInteger(comment?.originalLine) || positiveInteger(thread.originalLine);
+            const originalStart =
+              positiveInteger(comment?.originalStartLine) || positiveInteger(thread.originalStartLine);
+
+            if (originalEnd)
+              return normalizeRange(originalStart, originalEnd, true);
+
+            return null;
+          }
+
+          function normalizeRange(startLine, endLine, original) {
+            const markedEnd = endLine;
+            const markedStart = startLine || endLine;
+            const from = Math.min(markedStart, markedEnd);
+            const to = Math.max(markedStart, markedEnd);
+            const singleLine = from === to;
+
+            return {
+              contextStart: singleLine ? Math.max(1, from - 3) : from,
+              contextEnd: to,
+              markedStart: from,
+              markedEnd: to,
+              original,
+              singleLine,
+            };
+          }
+
+          function fallbackRef(pullRequest, range, comment) {
+            if (range?.original)
+              return comment?.originalCommit?.oid || comment?.commit?.oid || pullRequest.headRefOid;
+
+            return comment?.commit?.oid || pullRequest.headRefOid;
+          }
+
+          function formatCodeSnippet(content, path, range) {
+            const lines = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+            const start = Math.min(range.contextStart, lines.length);
+            const end = Math.min(range.contextEnd, lines.length);
+
+            if (!start || start > end)
+              return null;
+
+            const width = String(end).length;
+            const snippet = [];
+
+            for (let lineNumber = start; lineNumber <= end; ++lineNumber) {
+              const marker =
+                lineNumber >= range.markedStart && lineNumber <= range.markedEnd ? ">" : " ";
+              snippet.push(`${marker} ${String(lineNumber).padStart(width)} | ${lines[lineNumber - 1]}`);
+            }
+
+            const language = languageForPath(path);
+            const body = truncateDiffHunk(snippet.join("\n"));
+            return [`\`\`\`\`${language}`, body, "````"].join("\n");
+          }
+
+          async function formatCodeContext(thread, comment, pullRequest) {
             const diffHunk = truncateDiffHunk(comment?.diffHunk?.trim());
 
             if (!diffHunk)
-              return "_No diff hunk is available for this review thread._";
+              return await formatFallbackCodeContext(thread, comment, pullRequest);
 
             return ["````diff", diffHunk, "````"].join("\n");
           }
 
-          function formatThread(thread, index) {
+          async function formatFallbackCodeContext(thread, comment, pullRequest) {
+            const path = comment?.path || thread.path;
+            const range = fallbackRange(thread, comment);
+            const ref = fallbackRef(pullRequest, range, comment);
+
+            if (!path || !range || !ref)
+              return "_No diff hunk or exact source range is available for this review thread._";
+
+            const content = await getFileContent(path, ref);
+
+            if (!content)
+              return "_No diff hunk is available, and the source file could not be fetched._";
+
+            const snippet = formatCodeSnippet(content, path, range);
+
+            if (!snippet)
+              return "_No diff hunk is available, and the source range could not be found in the fetched file._";
+
+            const context =
+              range.singleLine
+                ? "showing the marked line with 3 preceding lines of context"
+                : `showing marked lines ${range.markedStart}-${range.markedEnd}`;
+
+            return [
+              `_Diff hunk unavailable; ${context} from ${range.original ? "the original comment commit" : "the comment commit"}._`,
+              "",
+              snippet,
+            ].join("\n");
+          }
+
+          async function formatThread(thread, index, pullRequest) {
             const comments = submittedVisibleComments(thread);
             const firstComment = comments[0] || thread.comments.nodes[0];
             const status = thread.isOutdated ? "unresolved, outdated by newer changes" : "unresolved";
             const url = firstComment?.url || `${serverUrl}/${repository}/pull/${prNumber}`;
             const lines = [
-              `### ${index}. ${formatLocation(thread)}`,
+              `### ${index}. ${formatLocation(thread, firstComment)}`,
               "",
               `${authorName(firstComment)} left [a review comment](${url}). Status: ${status}.`,
               "",
-              formatDiffHunk(firstComment),
+              await formatCodeContext(thread, firstComment, pullRequest),
               "",
               "**Reviewer comment**",
               "",
@@ -287,7 +459,7 @@ jobs:
             return title.length <= 250 ? title : `${title.slice(0, 247)}...`;
           }
 
-          function buildIssueBody(pullRequest, unresolvedThreads) {
+          async function buildIssueBody(pullRequest, unresolvedThreads) {
             const title = `# Follow-up review comments from PR #${pullRequest.number}`;
             const header = [
               issueMarker,
@@ -306,7 +478,7 @@ jobs:
             let truncated = false;
 
             for (const [index, thread] of unresolvedThreads.entries()) {
-              const section = `\n\n${formatThread(thread, index + 1)}`;
+              const section = `\n\n${await formatThread(thread, index + 1, pullRequest)}`;
 
               if (body.length + section.length > maxIssueBodyChars) {
                 truncated = true;
@@ -464,7 +636,7 @@ jobs:
               return;
             }
 
-            const bodyInfo = buildIssueBody(pullRequest, unresolvedThreads);
+            const bodyInfo = await buildIssueBody(pullRequest, unresolvedThreads);
             const { action, issue } = await createOrUpdateIssue(pullRequest, bodyInfo.body);
             await createOrUpdatePullRequestComment(
               issue,
