@@ -567,10 +567,11 @@ jobs:
             const replies = comments.slice(1);
 
             if (replies.length) {
+              const replyLabel = replies.length === 1 ? "comment" : "comments";
               lines.push(
                 "",
                 "<details>",
-                `<summary>Show replies (${replies.length} comments)</summary>`,
+                `<summary>Show replies (${replies.length} ${replyLabel})</summary>`,
                 ""
               );
 
