@@ -564,13 +564,18 @@ jobs:
               );
             }
 
-            if (comments.length > 1) {
-              lines.push("", "<details>", "<summary>Full thread</summary>", "");
+            const replies = comments.slice(1);
 
-              for (const comment of comments) {
-                lines.push(`#### ${authorName(comment)} on ${comment.createdAt}`);
-                lines.push("");
-                lines.push(`[Open comment](${comment.url})`);
+            if (replies.length) {
+              lines.push(
+                "",
+                "<details>",
+                `<summary>Show replies (${replies.length} comments)</summary>`,
+                ""
+              );
+
+              for (const comment of replies) {
+                lines.push(`#### ${authorName(comment)}`);
                 lines.push("");
                 lines.push(quote(comment.body));
                 lines.push("");
