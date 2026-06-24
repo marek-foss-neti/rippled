@@ -31,6 +31,33 @@ jobs:
   create-review-follow-up:
     runs-on: ubuntu-latest
     steps:
+      - name: Check Node.js runtime
+        run: |
+          if ! command -v node >/dev/null 2>&1; then
+              echo "::error::Node.js 18 or later is required to run this workflow, but node was not found on the runner."
+              exit 1
+          fi
+
+          node <<'EOF'
+          const majorVersion = Number(process.versions.node.split(".")[0]);
+
+          if (!Number.isInteger(majorVersion) || majorVersion < 18) {
+            console.error(
+              `::error::Node.js 18 or later is required because this workflow uses global fetch. Found ${process.version}.`
+            );
+            process.exit(1);
+          }
+
+          if (typeof fetch !== "function") {
+            console.error(
+              `::error::Global fetch is not available in ${process.version}. Use Node.js 18 or later.`
+            );
+            process.exit(1);
+          }
+
+          console.log(`Using Node.js ${process.version}.`);
+          EOF
+
       - name: Create or update follow-up issue
         env:
           GH_TOKEN: ${{ github.token }}
@@ -835,6 +862,10 @@ jobs:
             setOutput("unresolved_count", String(unresolvedThreads.length));
 
             if (!unresolvedThreads.length) {
+              setOutput("issue_number", "");
+              setOutput("issue_url", "");
+              setOutput("action", "skipped");
+              setOutput("assigned_to_pr_author", "false");
               console.log("No unresolved review threads found; no issue was created.");
               return;
             }
