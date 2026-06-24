@@ -1,10 +1,11 @@
-name: Create review follow-up issue
+name: Create an issue for PR follow-up
+description: Create a new issue or update existing one with a summary of all unresolved code reviews from a selected Pull Request
 
 on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: "Pull request number to scan for unresolved review comments"
+        description: "Pull Request number to scan for unresolved code reviews"
         required: true
         type: number
       issue_title:
@@ -12,7 +13,7 @@ on:
         required: false
         type: string
       labels:
-        description: "Optional comma-separated existing labels for a new follow-up issue"
+        description: "Optional comma-separated pre-existing labels for the follow-up issue"
         required: false
         type: string
         default: ""
