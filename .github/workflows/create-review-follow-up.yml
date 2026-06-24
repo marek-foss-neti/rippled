@@ -111,6 +111,9 @@ jobs:
               ) {
                 repository(owner: $owner, name: $repo) {
                   pullRequest(number: $number) {
+                    author {
+                      login
+                    }
                     headRefOid
                     number
                     title
@@ -701,6 +704,47 @@ jobs:
             return { action: "created", issue };
           }
 
+          async function assignIssueToPullRequestAuthor(pullRequest, issue) {
+            const author = pullRequest.author?.login;
+
+            if (!author) {
+              console.warn(`Pull request #${pullRequest.number} does not have an assignable author.`);
+              return false;
+            }
+
+            if (
+              issue.assignees?.some(
+                (assignee) => assignee.login?.toLowerCase() === author.toLowerCase()
+              )
+            ) {
+              console.log(`Issue #${issue.number} is already assigned to ${author}.`);
+              return true;
+            }
+
+            try {
+              const updatedIssue = await request(
+                "POST",
+                `/repos/${owner}/${repo}/issues/${issue.number}/assignees`,
+                { assignees: [author] }
+              );
+              const assigned = updatedIssue.assignees?.some(
+                (assignee) => assignee.login?.toLowerCase() === author.toLowerCase()
+              );
+
+              if (!assigned)
+                console.warn(
+                  `GitHub did not assign issue #${issue.number} to ${author}. The user may not be assignable in this repository.`
+                );
+              else
+                console.log(`Assigned issue #${issue.number} to ${author}.`);
+
+              return !!assigned;
+            } catch (error) {
+              console.warn(`Could not assign issue #${issue.number} to ${author}: ${error.message}`);
+              return false;
+            }
+          }
+
           async function listPullRequestComments() {
             const comments = [];
             let page = 1;
@@ -762,6 +806,9 @@ jobs:
             console.log(
               `Found ${threads.length} review thread(s), ${unresolvedThreads.length} unresolved.`
             );
+            console.log(
+              `Pull request #${pullRequest.number} state is ${pullRequest.state}; unresolved thread collection is not filtered by PR state.`
+            );
 
             setOutput("unresolved_count", String(unresolvedThreads.length));
 
@@ -772,6 +819,7 @@ jobs:
 
             const bodyInfo = await buildIssueBody(pullRequest, unresolvedThreads);
             const { action, issue } = await createOrUpdateIssue(pullRequest, bodyInfo.body);
+            const assignedToAuthor = await assignIssueToPullRequestAuthor(pullRequest, issue);
             await createOrUpdatePullRequestComment(
               issue,
               action,
@@ -782,6 +830,7 @@ jobs:
             setOutput("issue_number", String(issue.number));
             setOutput("issue_url", issue.html_url);
             setOutput("action", action);
+            setOutput("assigned_to_pr_author", String(assignedToAuthor));
 
             console.log(`${action} issue #${issue.number}: ${issue.html_url}`);
           }
